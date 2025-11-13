@@ -1,272 +1,237 @@
 """
-train_fuzzy.py (最终修正版)
-- 与演示脚本保持一致的感知与控制逻辑：
-  - nearest_point_ahead（优先选择车前方目标）
-  - 模糊前向权重 = far + 0.5*mid
-  - 自适应混合：根据前向安全程度在目标/模糊间动态混合
-- 训练保存：./car_route/best_controller.npy 和 train_metadata.npz
+pp_gap_train.py
+简单的 GA 用来调优 Pure Pursuit + Gap-Avoidance 参数
+
+参数向量（长度 6）:
+ [Kp, safe_dist, lookahead_steps, beta, beam_step_deg, lookahead_wp]
+
+注意:
+- 训练在 CPU 上运行，默认 generations=40, pop_size=24。可调小做快速测试。
+- 运行后保存： car_route/best_pp_params.npy
+- 评估时会随机生成障碍布局并计算平均得分（距离+稳定性-碰撞惩罚-偏航惩罚）
+
+运行:
+    python car_route/pp_gap_train.py
 """
 
-import math
-import random
-import numpy as np
-import os
-import time
+import numpy as np, random, math, time, os
+from copy import deepcopy
 
-# ================= 参数设置 =================
-MAX_STEER = math.radians(30)
-SENSOR_RANGE = 120.0
-POP_SIZE = 36
-MUT_RATE = 0.12
-MUT_SCALE = 0.25
+# ---- GA hyperparams ----
+POP_SIZE = 24
+GENERATIONS = 40
+MUT_RATE = 0.18
+MUT_SCALE = 0.15
 ELITE = 2
-EVAL_EPISODES = 5
-EPISODE_STEPS = 800
+EPISODES = 6
+EPISODE_STEPS = 600
 
-TRACK_A_OUT, TRACK_B_OUT = 250, 180
-TRACK_A_IN, TRACK_B_IN = 180, 130
-TRACK_CX, TRACK_CY = 450, 300
+# ---- bounds for params ----
+# [Kp, safe_dist, lookahead_steps, beta, beam_step_deg, lookahead_wp]
+BOUNDS = [
+    (0.3, 2.0),   # Kp
+    (30.0, 120.0),# safe_dist
+    (2, 30),      # lookahead_steps (int)
+    (0.5, 0.95),  # beta
+    (3.0, 12.0),  # beam_step_deg
+    (20.0, 120.0) # lookahead_wp
+]
 
-FUZZY_LABELS = ['near', 'mid', 'far']
+# ---- world utilities copied from sim (lightweight) ----
+CX, CY = 900//2, 700//2
+A_OUT, B_OUT = 300, 220
+A_IN, B_IN = 210, 160
 
-# =================== 隶属函数 ===================
-def tri_mf(x, a, b, c):
-    if x <= a or x >= c:
-        return 0.0
-    if x == b:
-        return 1.0
-    if x < b:
-        return (x - a) / (b - a) if (b - a) != 0 else 0.0
-    return (c - x) / (c - b) if (c - b) != 0 else 0.0
+def point_in_track(x,y):
+    dx, dy = x-CX, y-CY
+    val_out = (dx/A_OUT)**2 + (dy/B_OUT)**2
+    val_in = (dx/A_IN)**2 + (dy/B_IN)**2
+    return (val_in >= 1.0) and (val_out <= 1.0)
 
-FUZZY_POINTS = {
-    'near': (0.0, 0.0, 0.5),
-    'mid': (0.0, 0.5, 1.0),
-    'far': (0.5, 1.0, 1.0),
-}
-
-def fuzzify_sensor(val):
-    m = {}
-    for k, (a, b, c) in FUZZY_POINTS.items():
-        m[k] = tri_mf(val, a, b, c)
-    return m
-
-# =================== 椭圆赛道 ===================
-class EllipseTrack:
-    def __init__(self):
-        self.cx, self.cy = TRACK_CX, TRACK_CY
-        self.a_out, self.b_out = TRACK_A_OUT, TRACK_B_OUT
-        self.a_in, self.b_in = TRACK_A_IN, TRACK_B_IN
-
-    def inside_track(self, x, y):
-        dx = x - self.cx
-        dy = y - self.cy
-        val_out = (dx / self.a_out) ** 2 + (dy / self.b_out) ** 2
-        val_in = (dx / self.a_in) ** 2 + (dy / self.b_in) ** 2
-        return val_in >= 1.0 and val_out <= 1.0
-
-    def nearest_point_ahead(self, x, y, heading, samples=360, lookahead=14):
-        mid_a = (self.a_in + self.a_out) / 2.0
-        mid_b = (self.b_in + self.b_out) / 2.0
-        best_idx = 0
-        best_d2 = float('inf')
-        pts = []
-        for k in range(samples):
-            ang = 2 * math.pi * k / samples
-            px = self.cx + mid_a * math.cos(ang)
-            py = self.cy + mid_b * math.sin(ang)
-            pts.append((px, py))
-            d2 = (px - x)**2 + (py - y)**2
-            if d2 < best_d2:
-                best_d2 = d2
-                best_idx = k
-        chosen_idx = best_idx
-        best_abs = float('inf')
-        for offs in range(0, lookahead+1):
-            k = (best_idx + offs) % samples
-            px, py = pts[k]
-            target_angle = math.atan2(py - y, px - x)
-            diff = (target_angle - heading + math.pi) % (2*math.pi) - math.pi
-            if abs(diff) < math.pi/2:
-                if abs(diff) < best_abs:
-                    best_abs = abs(diff)
-                    chosen_idx = k
-        return chosen_idx
-
-# =================== 世界 ===================
-class World:
-    def __init__(self, seed=None):
-        self.rng = random.Random(seed)
-        self.track = EllipseTrack()
-        self.obstacles = []
-        self.generate_obstacles()
-
-    def generate_obstacles(self):
-        self.obstacles = []
-        for _ in range(10):
-            attempts = 0
-            while True:
-                attempts += 1
-                angle = random.uniform(0, 2 * math.pi)
-                a = random.uniform(self.track.a_in + 20, self.track.a_out - 20)
-                b = random.uniform(self.track.b_in + 20, self.track.b_out - 20)
-                x = self.track.cx + a * math.cos(angle)
-                y = self.track.cy + b * math.sin(angle)
-                size = random.uniform(15, 25)
-                if self.track.inside_track(x, y):
-                    self.obstacles.append((x, y, size))
-                    break
-                if attempts > 300:
-                    break
-
-    def query_distance(self, x, y, angle, max_range=SENSOR_RANGE):
-        step = 3.0
-        dist = 0.0
-        dx, dy = math.cos(angle), math.sin(angle)
-        while dist < max_range:
-            px = x + dx * dist
-            py = y + dy * dist
-            if not self.track.inside_track(px, py):
+def ray_distance(x,y,ang, obstacles, max_range=120.0, step=3.0):
+    dist=0.0
+    dx, dy = math.cos(ang), math.sin(ang)
+    while dist < max_range:
+        px = x + dx*dist; py = y + dy*dist
+        if not point_in_track(px,py):
+            return dist
+        for ox,oy,s in obstacles:
+            if abs(px-ox)<=s/2 and abs(py-oy)<=s/2:
                 return dist
-            for ox, oy, s in self.obstacles:
-                if abs(px - ox) <= s / 2 and abs(py - oy) <= s / 2:
-                    return dist
-            dist += step
-        return max_range
+        dist += step
+    return max_range
 
-# =================== 车辆 ===================
-class Car:
-    def __init__(self, x, y):
-        self.x = x
-        self.y = y
-        self.heading = 0.0
-        self.speed = 2.0
+def generate_obstacles(n=10, seed=None):
+    rng = random.Random(seed)
+    obs=[]
+    for _ in range(n):
+        attempts=0
+        while True:
+            attempts+=1
+            angle = rng.uniform(0,2*math.pi)
+            a = rng.uniform(A_IN+20, A_OUT-20)
+            b = rng.uniform(B_IN+20, B_OUT-20)
+            x = CX + a*math.cos(angle)
+            y = CY + b*math.sin(angle)
+            size = rng.uniform(15,25)
+            if point_in_track(x,y):
+                obs.append((x,y,size))
+                break
+            if attempts>300: break
+    return obs
 
-    def step(self, steer):
-        steer = max(-MAX_STEER, min(MAX_STEER, steer))
-        self.heading += steer * 0.08
-        self.x += math.cos(self.heading) * self.speed
-        self.y += math.sin(self.heading) * self.speed
+def cast_beams_nums(x,y,heading,beam_step_deg, obstacles, max_range=120.0):
+    beams=[]
+    half=90
+    a = -half
+    while a<=half+1e-6:
+        ang = heading + math.radians(a)
+        d = ray_distance(x,y,ang,obstacles, max_range=max_range)
+        beams.append((a,d))
+        a += beam_step_deg
+    return beams
 
-    def collided(self, world):
-        if not world.track.inside_track(self.x, self.y):
-            return True
-        for ox, oy, s in world.obstacles:
-            if abs(self.x - ox) <= s / 2 + 5 and abs(self.y - oy) <= s / 2 + 5:
-                return True
-        return False
+def detect_gaps_nums(beams, safe_dist):
+    free = [1 if d>safe_dist else 0 for (_,d) in beams]
+    gaps=[]
+    n=len(free); i=0
+    while i<n:
+        if free[i]==1:
+            j=i
+            while j<n and free[j]==1: j+=1
+            angles=[beams[k][0] for k in range(i,j)]
+            center=(angles[0]+angles[-1])/2.0
+            width=angles[-1]-angles[0]+1e-9
+            gaps.append({'start':i,'end':j-1,'center':center,'width':width})
+            i=j
+        else:
+            i+=1
+    return gaps
 
-# =================== 模糊控制器（返回 steer, front_m） ===================
-class FuzzyController:
-    def __init__(self, rule_vector):
-        self.rules = np.array(rule_vector, dtype=float)
+def find_pursuit_target_simple(x,y, waypoints, lookahead_dist):
+    best_idx=0; best_d2=1e12
+    for i,(wx,wy) in enumerate(waypoints):
+        d2=(wx-x)**2+(wy-y)**2
+        if d2<best_d2:
+            best_d2=d2; best_idx=i
+    idx=best_idx; acc=0.0; samples=len(waypoints)
+    while acc<lookahead_dist:
+        nxt=(idx+1)%samples
+        dx = waypoints[nxt][0]-waypoints[idx][0]
+        dy = waypoints[nxt][1]-waypoints[idx][1]
+        seg = math.hypot(dx,dy); acc+=seg; idx=nxt
+        if acc>10000: break
+    return waypoints[idx], idx
 
-    def decide(self, left_dist, front_dist, right_dist):
-        ln = max(0.0, min(1.0, left_dist / SENSOR_RANGE))
-        rn = max(0.0, min(1.0, right_dist / SENSOR_RANGE))
-        fn = max(0.0, min(1.0, front_dist / SENSOR_RANGE))
-        left_m = fuzzify_sensor(ln)
-        right_m = fuzzify_sensor(rn)
-        front_m = fuzzify_sensor(fn)
-        front_weight = front_m['far'] + 0.5 * front_m['mid']
-        out_num = 0.0
-        out_den = 0.0
-        for i, llabel in enumerate(FUZZY_LABELS):
-            for j, rlabel in enumerate(FUZZY_LABELS):
-                mu = left_m[llabel] * right_m[rlabel] * front_weight
-                val = self.rules[i * 3 + j]
-                out_num += mu * val
-                out_den += mu
-        steer = out_num / out_den if out_den > 1e-8 else 0.0
-        steer = max(-MAX_STEER, min(MAX_STEER, steer))
-        return steer, front_m
+WAYPOINTS = [(CX + ((A_IN+A_OUT)/2.0)*math.cos(2*math.pi*k/360), CY + ((B_IN+B_OUT)/2.0)*math.sin(2*math.pi*k/360)) for k in range(360)]
 
-# =================== GA ===================
-class GAOptimizer:
-    def __init__(self):
-        self.pop = [np.random.uniform(-MAX_STEER, MAX_STEER, 9) for _ in range(POP_SIZE)]
-        self.fitness = np.zeros(POP_SIZE)
-        self.generation = 0
+# ---- evaluation of a parameter vector ----
+def evaluate(params, seed=None):
+    Kp, safe_dist, lookahead_steps, beta, beam_step_deg, lookahead_wp = params
+    lookahead_steps = int(round(lookahead_steps))
+    total = 0.0
+    rng = random.Random(seed)
+    for ep in range(EPISODES):
+        # random start
+        angle0 = rng.uniform(0,2*math.pi)
+        r0 = rng.uniform(A_IN+20, A_OUT-20)
+        x = CX + r0*math.cos(angle0)
+        y = CY + r0*math.sin(angle0)
+        heading = rng.uniform(-math.pi, math.pi)
+        obstacles = generate_obstacles(n=10, seed=rng.randint(0,100000))
+        alive = True
+        score = 0.0
+        prev_steer = 0.0
+        for step in range(EPISODE_STEPS):
+            beams = cast_beams_nums(x,y,heading,beam_step_deg, obstacles, max_range=120.0)
+            gaps = detect_gaps_nums(beams, safe_dist)
+            target_pt, tidx = find_pursuit_target_simple(x,y, WAYPOINTS, lookahead_wp)
+            target_angle = math.atan2(target_pt[1]-y, target_pt[0]-x)
+            angle_to_wp = (target_angle - heading + math.pi)%(2*math.pi) - math.pi
+            front_blocked = any(d<safe_dist for (a,d) in beams if abs(a)<=20)
+            chosen_dir = angle_to_wp
+            if front_blocked and gaps:
+                best=None; bd=1e9
+                for g in gaps:
+                    g_ang = math.radians(g['center'])
+                    diff = abs(((g_ang - angle_to_wp + math.pi)%(2*math.pi) - math.pi))
+                    if diff < bd:
+                        bd = diff; best=g
+                if best: chosen_dir = math.radians(best['center'])
+            # steer
+            raw = Kp * chosen_dir
+            raw = max(-math.radians(30), min(math.radians(30), raw))
+            steer = prev_steer * beta + raw * (1-beta)
+            prev_steer = steer
+            # step forward
+            heading += steer * 0.08
+            x += math.cos(heading)*2.0
+            y += math.sin(heading)*2.0
+            # collision
+            if not point_in_track(x,y):
+                alive=False; score -= 150; break
+            for ox,oy,s in obstacles:
+                if abs(x-ox)<=s/2+5 and abs(y-oy)<=s/2+5:
+                    alive=False; score -= 150; break
+            if not alive: break
+            # reward: forward progress + closeness to midline
+            dx = x - CX; dy = y - CY
+            d_center = math.hypot(dx,dy)
+            track_center = (A_IN + A_OUT)/2.0
+            step_reward = 1.0 + max(0, 1 - abs(d_center - track_center)/track_center)
+            # small penalty on large absolute heading diff to encourage facing forward
+            step_reward -= 0.05 * abs(angle_to_wp)
+            score += step_reward
+        total += score
+    return total/EPISODES
 
-    def evaluate_individual(self, ind_vector, seed=None):
-        total = 0.0
-        for e in range(EVAL_EPISODES):
-            world = World(seed=(seed + e if seed else None))
-            angle0 = random.uniform(0, 2*math.pi)
-            r0 = random.uniform(world.track.a_in + 20, world.track.a_out - 20)
-            x0 = world.track.cx + r0 * math.cos(angle0)
-            y0 = world.track.cy + r0 * math.sin(angle0)
-            car = Car(x0, y0)
-            controller = FuzzyController(ind_vector)
-            score = 0.0
-            for _ in range(EPISODE_STEPS):
-                left = world.query_distance(car.x, car.y, car.heading + math.radians(-45))
-                right = world.query_distance(car.x, car.y, car.heading + math.radians(45))
-                front = world.query_distance(car.x, car.y, car.heading)
-                fuzzy, front_m = controller.decide(left, front, right)
+# ---- GA ----
+def random_individual():
+    vec = []
+    for (lo,hi) in BOUNDS:
+        vec.append(random.uniform(lo,hi))
+    return np.array(vec)
 
-                idx = world.track.nearest_point_ahead(car.x, car.y, car.heading, samples=360, lookahead=14)
-                tx = world.track.cx + ((world.track.a_in + world.track.a_out)/2) * math.cos(2*math.pi*idx/360)
-                ty = world.track.cy + ((world.track.b_in + world.track.b_out)/2) * math.sin(2*math.pi*idx/360)
-                target_angle = math.atan2(ty - car.y, tx - car.x)
-                diff = (target_angle - car.heading + math.pi) % (2*math.pi) - math.pi
+def mutate(child):
+    for i in range(len(child)):
+        if random.random() < MUT_RATE:
+            lo,hi = BOUNDS[i]
+            span = hi-lo
+            child[i] += random.gauss(0, MUT_SCALE*span)
+            child[i] = max(lo, min(hi, child[i]))
+    return child
 
-                front_weight = front_m['far'] + 0.5 * front_m['mid']
-                alpha_target = 1.0 - front_weight
-                alpha_target = max(0.1, min(0.6, alpha_target))
-                K_diff = 0.4
+def crossover(a,b):
+    return 0.5*(a+b)
 
-                steer = alpha_target * (K_diff * diff) + (1.0 - alpha_target) * fuzzy
-                car.step(steer)
-                if car.collided(world):
-                    score -= 100
-                    break
-                dx = car.x - world.track.cx
-                dy = car.y - world.track.cy
-                d_center = math.sqrt(dx**2 + dy**2)
-                track_center = (world.track.a_in + world.track.a_out)/2
-                score += 1 + max(0, 1 - abs(d_center - track_center)/track_center)
-            total += score
-        return total / EVAL_EPISODES
-
-    def epoch(self):
-        for i, ind in enumerate(self.pop):
-            self.fitness[i] = self.evaluate_individual(ind, seed=self.generation*100 + i)
-        elite_idx = np.argsort(self.fitness)[-ELITE:][::-1]
-        new_pop = [self.pop[idx].copy() for idx in elite_idx]
+def run():
+    pop = [random_individual() for _ in range(POP_SIZE)]
+    fitness = np.zeros(POP_SIZE)
+    best = None; best_f = -1e12
+    for g in range(GENERATIONS):
+        for i,ind in enumerate(pop):
+            fitness[i] = evaluate(ind, seed=g*100+i)
+        idxs = np.argsort(fitness)
+        # log
+        print(f"Gen {g+1}/{GENERATIONS} best={fitness[idxs[-1]]:.1f} mean={fitness.mean():.1f}")
+        if fitness[idxs[-1]] > best_f:
+            best_f = fitness[idxs[-1]]; best = pop[idxs[-1]].copy()
+        # elitism
+        new_pop = [pop[idxs[-1-i]].copy() for i in range(ELITE)]
         while len(new_pop) < POP_SIZE:
-            a, b = random.sample(self.pop, 2)
-            child = 0.5*(a + b)
-            for i in range(9):
-                if random.random() < MUT_RATE:
-                    child[i] += np.random.normal(0, MUT_SCALE*MAX_STEER)
-            new_pop.append(np.clip(child, -MAX_STEER, MAX_STEER))
-        self.pop = new_pop
-        self.generation += 1
+            a,b = random.sample(pop,2)
+            child = crossover(a,b)
+            child = mutate(child)
+            new_pop.append(child)
+        pop = new_pop
+    # save best
+    os.makedirs("car_route", exist_ok=True)
+    np.save("car_route/best_pp_params.npy", best)
+    np.savez("car_route/pp_train_meta.npz", best_fitness=best_f, gens=GENERATIONS)
+    print("Saved best to car_route/best_pp_params.npy best_f=", best_f)
+    return best
 
-    def best_controller(self):
-        return self.pop[int(np.argmax(self.fitness))]
-
-# =================== 主程序 ===================
 if __name__ == "__main__":
-    ga = GAOptimizer()
-    generations = 60
-    best_overall = None
-    best_fitness = -1e9
-    start_time = time.time()
-    for g in range(generations):
-        ga.epoch()
-        gen_best = np.max(ga.fitness)
-        print(f"第 {g+1}/{generations} 代，最佳适应度 = {gen_best:.1f}")
-        if gen_best > best_fitness:
-            best_fitness = gen_best
-            best_overall = ga.best_controller().copy()
-    elapsed = time.time() - start_time
-    os.makedirs("./car_route", exist_ok=True)
-    if best_overall is not None:
-        np.save("./car_route/best_controller.npy", best_overall)
-        np.savez("./car_route/train_metadata.npz", best_fitness=best_fitness, generations=generations, elapsed_seconds=elapsed)
-        print("✅ 训练完成，已保存最佳参数到 car_route/best_controller.npy")
-        print(f"最佳适应度: {best_fitness:.2f}, 用时 {elapsed:.1f}s")
-    else:
-        print("训练失败：未找到最佳参数。")
+    start=time.time()
+    best = run()
+    print("Time:", time.time()-start)
