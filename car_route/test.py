@@ -1,5 +1,0 @@
-import numpy as np 
-scale = 2000.0 
-a = np.array([0.05493515454578535, -0.07820290735644803, 0.00651869440688202, -0.13839101980279522, -0.0253814165407215, -0.018948391281768277, -0.03866064165447704, 0.05034315800544732, -0.09659851539636921]) *scale
-np.save('car_route/best_controller.npy', a) 
-print('saved car_route/best_controller.npy, shape=', a.shape) 
