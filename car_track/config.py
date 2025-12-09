@@ -1,5 +1,5 @@
 """
-Configuration constants for the refactored PP+Gap project.
+初始化参数
 """
 
 WIDTH = 900
@@ -21,14 +21,14 @@ DEFAULT_PARAMS = {
     'safe_dist': 60.0,          # 安全距离
     'lookahead_steps': 10,      # 前瞻步数
     'beta': 0.75,               # 指数平滑系数
-    'beam_step_deg': 6.0,       # 激光束步进角度
+    'beam_step_deg': 7.5,       # 激光束步进角度
     'lookahead_wp': 60.0,       # 前瞻路径点距离
     # 模糊PID参数
     'use_fuzzy_pid': True,
-    'pid_kp': 0.9,        # PID比例增益
-    'pid_ki': 0.01,       # PID积分增益
-    'pid_kd': 0.05,       # PID微分增益
-    'pid_integral_limit': 1.0,  # PID积分限制
+    'pid_kp': 1,        # PID比例增益
+    'pid_ki': 0.1,       # PID积分增益
+    'pid_kd': 0.1,       # PID微分增益
+    # 'pid_integral_limit': 1.0,  # PID积分限制
 }
 
 # Paths
